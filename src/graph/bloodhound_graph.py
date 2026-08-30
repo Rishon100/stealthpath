@@ -72,7 +72,11 @@ def build_attack_graph(data_dir):
         path = data_dir / filename
 
         if path.exists():
-            objects.extend(load_json(path))
+            file_objects = load_json(path)
+
+            for obj in file_objects:
+                obj["object_type"] = filename.split("_")[-1].split(".")[0]
+                objects.append(obj)
 
     # ---------------------------------------------------------
     # 2. Build object lookup
@@ -91,6 +95,7 @@ def build_attack_graph(data_dir):
         graph.add_node(
             object_id,
             name=get_name(obj),
+            object_type=obj.get("object_type"),
         )
 
     # ---------------------------------------------------------
