@@ -86,3 +86,19 @@ def test_node_types():
         print(f"  {object_type}: {count}")
 
     assert graph.number_of_nodes() > 0
+
+def test_show_one_edge():
+    graph = build_attack_graph(DATA_DIR)
+
+    source, target, data = next(iter(graph.edges(data=True)))
+
+    print("\nOne edge:")
+    print("Source:", source)
+    print("Source name:", data["source_name"])
+    print("Relationship:", data["relationship"])
+    print("Target:", target)
+    print("Target name:", data["target_name"])
+
+    assert source is not None
+    assert target is not None
+    assert data["relationship"]
