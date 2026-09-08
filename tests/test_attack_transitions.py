@@ -19,6 +19,7 @@ def test_available_transitions():
         assert "target" in transition
         assert "relationship" in transition
         assert "target_name" in transition
+        assert "edge_key" in transition
 
 
 def test_transition_matches_graph_edge():
@@ -62,3 +63,29 @@ def test_show_available_transitions():
             f"  -> {transition['target_name']} "
             f"[{transition['relationship']}]"
         )
+
+def test_transition_edge_key_matches_graph_edge():
+    graph = build_attack_graph(DATA_DIR)
+
+    source = next(
+    node for node in graph.nodes
+    if graph.nodes[node].get("name") == "ADMINISTRATORS@ESSOS.LOCAL"
+)
+
+    transitions = get_available_transitions(
+        graph,
+        source
+    )
+
+    for transition in transitions:
+        edge_key = transition["edge_key"]
+        target = transition["target"]
+
+        edge = graph.get_edge_data(
+            source,
+            target,
+            key=edge_key
+        )
+
+        assert edge is not None
+        assert edge["relationship"] == transition["relationship"]

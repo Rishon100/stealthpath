@@ -28,9 +28,10 @@ def test_shortest_path_on_real_essos_graph():
 
     path = find_shortest_path(graph, source, target)
 
-    assert path[0] == source
-    assert path[-1] == target
-    assert len(path) >= 2
+    assert path.nodes[0] == source
+    assert path.nodes[-1] == target
+    assert path.length >= 1
+    assert path.cost == path.length
 
 
 def test_shortest_path_is_valid():
@@ -48,8 +49,7 @@ def test_shortest_path_is_valid():
 
     path = find_shortest_path(graph, source, target)
 
-    for current, next_node in zip(path, path[1:]):
-        assert graph.has_edge(current, next_node)
+    path.validate(graph)
 
 
 def test_show_real_shortest_path():
@@ -69,17 +69,15 @@ def test_show_real_shortest_path():
 
     print("\nReal ESSOS shortest path:")
 
-    for current, next_node in zip(path, path[1:]):
-        relationships = [
-            data.get("relationship")
-            for data in graph.get_edge_data(
-                current,
-                next_node
-            ).values()
-        ]
+    for index, edge_key in enumerate(path.edges):
+        edge = graph.get_edge_data(
+            path.nodes[index],
+            path.nodes[index + 1],
+            key=edge_key,
+        )
 
         print(
-            f"  {graph.nodes[current]['name']}"
-            f" -- {relationships} --> "
-            f"{graph.nodes[next_node]['name']}"
+            f"  {graph.nodes[path.nodes[index]]['name']}"
+            f" -- {edge['relationship']} --> "
+            f"{graph.nodes[path.nodes[index + 1]]['name']}"
         )
