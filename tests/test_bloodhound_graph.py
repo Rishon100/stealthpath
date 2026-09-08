@@ -102,3 +102,29 @@ def test_show_one_edge():
     assert source is not None
     assert target is not None
     assert data["relationship"]
+
+def test_edge_object_types():
+    graph = build_attack_graph(DATA_DIR)
+
+    count = 0
+
+    print("\nSample edges with object types:")
+
+    for source, target, data in graph.edges(data=True):
+        source_type = graph.nodes[source].get("object_type")
+        target_type = graph.nodes[target].get("object_type")
+
+        print(
+            data["source_name"],
+            "[", source_type, "]",
+            "--", data["relationship"], "-->",
+            data["target_name"],
+            "[", target_type, "]"
+        )
+
+        count += 1
+
+        if count == 10:
+            break
+
+    assert count == 10
