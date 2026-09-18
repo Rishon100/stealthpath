@@ -1,35 +1,34 @@
+import json
 import sys
+import tempfile
+import zipfile
 from pathlib import Path
 
+import networkx as nx
+import streamlit as st
+
 # ---------------------------------------------------------
-# Make the project root visible to Python
+# Project import setup
 # ---------------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-
-import streamlit as st
-import networkx as nx
-
-from src.graph.bloodhound_graph import build_attack_graph
+from src.graph.bloodhound_graph import (
+    build_attack_graph,
+    WALKABLE_RELATIONSHIPS,
+)
 from src.graph.attack_transitions import get_available_transitions
 from src.planners.shortest_path import find_shortest_path
 
 
 # ---------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------
-
-DATA_DIR = PROJECT_ROOT / "data" / "ESSOS_20240410083816"
-
-
-# ---------------------------------------------------------
-# Page setup
+# Page configuration
 # ---------------------------------------------------------
 
 st.set_page_config(
     page_title="StealthPath",
+    page_icon=None,
     layout="wide",
 )
 
@@ -41,82 +40,37 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-
-    .stApp {
-        background-color: #ffffff;
-        color: #000000;
-    }
-
-    h1, h2, h3 {
-        color: #000000;
+    .main {
+        padding-top: 1rem;
     }
 
     .block-container {
-        max-width: 1450px;
+        max-width: 1400px;
         padding-top: 2rem;
-        padding-bottom: 3rem;
     }
 
-    .header-box {
-        border-bottom: 2px solid #000000;
-        padding-bottom: 18px;
-        margin-bottom: 25px;
-    }
-
-    .info-box {
-        border: 1px solid #000000;
-        padding: 18px;
-        margin-bottom: 15px;
-        background: #ffffff;
-    }
-
-    .metric-box {
-        border: 1px solid #000000;
+    .metric-card {
+        border: 1px solid #d9d9d9;
+        border-radius: 8px;
         padding: 16px;
-        text-align: center;
-        background: #ffffff;
-    }
-
-    .metric-number {
-        font-size: 28px;
-        font-weight: 600;
-    }
-
-    .metric-label {
-        font-size: 13px;
-        margin-top: 4px;
+        background: white;
     }
 
     .status-box {
-        border: 1px solid #000000;
-        padding: 18px;
-        margin: 8px 0;
-        background: #ffffff;
-        min-height: 120px;
+        border: 1px solid #d9d9d9;
+        border-radius: 8px;
+        padding: 16px;
+        margin-bottom: 12px;
     }
 
-    .path-step {
-        border: 1px solid #000000;
-        padding: 12px;
-        margin: 5px 0;
-        text-align: center;
+    .small-text {
+        color: #666666;
+        font-size: 0.9rem;
+    }
+
+    h1, h2, h3 {
         font-weight: 600;
-        background: #ffffff;
     }
-
-    .path-relation {
-        text-align: center;
-        padding: 6px;
-        font-size: 13px;
-    }
-
-    .guide-box {
-        border-left: 3px solid #000000;
-        padding: 12px 16px;
-        margin: 10px 0 20px 0;
-        background: #fafafa;
-    }
-
     </style>
     """,
     unsafe_allow_html=True,
@@ -124,72 +78,639 @@ st.markdown(
 
 
 # ---------------------------------------------------------
-# Load graph
+# Constants
 # ---------------------------------------------------------
 
-@st.cache_resource
-def load_graph():
-    return build_attack_graph(DATA_DIR)
-
-
-graph = load_graph()
+ESSOS_DIR = (
+    PROJECT_ROOT
+    / "data"
+    / "ESSOS_20240410083816"
+)
 
 
 # ---------------------------------------------------------
-# Helper functions
+# General graph helpers
 # ---------------------------------------------------------
 
-def get_node_name(node):
-    """
-    Return the human-readable BloodHound name.
+def get_node_name(graph, node_id):
+    """Return a readable node name."""
 
-    The internal ObjectIdentifier is only used when
-    no readable name is available.
-    """
+    data = graph.nodes[node_id]
 
-    name = graph.nodes[node].get("name")
-
-    if name:
-        return str(name)
-
-    return f"Unknown Node ({node})"
+    return data.get("name", node_id)
 
 
-def get_node_type(node):
-    """
-    Return the object type stored in the graph.
-    """
+def get_node_type(graph, node_id):
+    """Return the node type."""
 
-    return graph.nodes[node].get(
-        "object_type",
-        "Unknown",
-    )
+    data = graph.nodes[node_id]
+
+    return data.get("object_type", "unknown")
 
 
-def get_node_by_name(name):
-    """
-    Find a node using its display name.
-    """
+def get_node_by_name(graph, name):
+    """Find a node ID from its display name."""
 
-    for node, data in graph.nodes(data=True):
+    for node_id, data in graph.nodes(data=True):
 
         if data.get("name") == name:
-            return node
+            return node_id
 
     return None
 
+
+def get_relationship_counts(graph):
+    """Count graph relationships."""
+
+    counts = {}
+
+    for _, _, data in graph.edges(data=True):
+
+        relationship = data.get(
+            "relationship",
+            "Unknown",
+        )
+
+        counts[relationship] = (
+            counts.get(relationship, 0) + 1
+        )
+
+    return counts
+
+
+def get_node_type_counts(graph):
+    """Count nodes by object type."""
+
+    counts = {}
+
+    for _, data in graph.nodes(data=True):
+
+        node_type = data.get(
+            "object_type",
+            "unknown",
+        )
+
+        counts[node_type] = (
+            counts.get(node_type, 0) + 1
+        )
+
+    return counts
+
+
+# ---------------------------------------------------------
+# Generic graph loaders
+# ---------------------------------------------------------
+
+def load_csv_graph(uploaded_file):
+    """
+    Load a simple CSV graph.
+
+    Required columns:
+        source,target
+
+    Optional:
+        relationship
+    """
+
+    import pandas as pd
+
+    df = pd.read_csv(uploaded_file)
+
+    columns = {
+        column.lower(): column
+        for column in df.columns
+    }
+
+    if "source" not in columns or "target" not in columns:
+        raise ValueError(
+            "CSV must contain source and target columns."
+        )
+
+    source_column = columns["source"]
+    target_column = columns["target"]
+
+    relationship_column = columns.get(
+        "relationship"
+    )
+
+    graph = nx.MultiDiGraph()
+
+    for _, row in df.iterrows():
+
+        source = str(row[source_column])
+        target = str(row[target_column])
+
+        if source not in graph:
+            graph.add_node(
+                source,
+                name=source,
+                object_type="generic",
+            )
+
+        if target not in graph:
+            graph.add_node(
+                target,
+                name=target,
+                object_type="generic",
+            )
+
+        relationship = "Unknown"
+
+        if relationship_column:
+            relationship = str(
+                row[relationship_column]
+            )
+
+        graph.add_edge(
+            source,
+            target,
+            relationship=relationship,
+            source_name=source,
+            target_name=target,
+        )
+
+    return graph
+
+
+def load_json_graph(uploaded_file):
+    """
+    Load a generic JSON graph.
+
+    Supported structure:
+
+    {
+        "nodes": [...],
+        "edges": [...]
+    }
+
+    Each edge should contain:
+        source
+        target
+
+    Optional:
+        relationship
+    """
+
+    raw = uploaded_file.read()
+
+    data = json.loads(raw)
+
+    if not isinstance(data, dict):
+        raise ValueError(
+            "JSON graph must be an object."
+        )
+
+    nodes = data.get("nodes", [])
+    edges = data.get("edges", [])
+
+    if not edges:
+        raise ValueError(
+            "JSON graph must contain an edges list."
+        )
+
+    graph = nx.MultiDiGraph()
+
+    # Add explicit nodes first.
+    for node in nodes:
+
+        if isinstance(node, dict):
+
+            node_id = (
+                node.get("id")
+                or node.get("ObjectIdentifier")
+                or node.get("name")
+            )
+
+            if not node_id:
+                continue
+
+            graph.add_node(
+                str(node_id),
+                name=node.get(
+                    "name",
+                    str(node_id),
+                ),
+                object_type=node.get(
+                    "object_type",
+                    "generic",
+                ),
+            )
+
+        else:
+
+            node_id = str(node)
+
+            graph.add_node(
+                node_id,
+                name=node_id,
+                object_type="generic",
+            )
+
+    # Add edges.
+    for edge in edges:
+
+        if not isinstance(edge, dict):
+            continue
+
+        source = edge.get("source")
+        target = edge.get("target")
+
+        if source is None or target is None:
+            continue
+
+        source = str(source)
+        target = str(target)
+
+        if source not in graph:
+
+            graph.add_node(
+                source,
+                name=source,
+                object_type="generic",
+            )
+
+        if target not in graph:
+
+            graph.add_node(
+                target,
+                name=target,
+                object_type="generic",
+            )
+
+        graph.add_edge(
+            source,
+            target,
+            relationship=edge.get(
+                "relationship",
+                "Unknown",
+            ),
+            source_name=source,
+            target_name=target,
+        )
+
+    return graph
+
+
+def load_graphml(uploaded_file):
+    """Load a GraphML graph."""
+
+    with tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=".graphml",
+    ) as temp_file:
+
+        temp_file.write(
+            uploaded_file.getvalue()
+        )
+
+        temp_path = temp_file.name
+
+    graph = nx.read_graphml(temp_path)
+
+    converted = nx.MultiDiGraph()
+
+    for node, data in graph.nodes(data=True):
+
+        converted.add_node(
+            str(node),
+            name=data.get(
+                "name",
+                str(node),
+            ),
+            object_type=data.get(
+                "object_type",
+                "generic",
+            ),
+        )
+
+    for source, target, data in graph.edges(
+        data=True
+    ):
+
+        converted.add_edge(
+            str(source),
+            str(target),
+            relationship=data.get(
+                "relationship",
+                "Unknown",
+            ),
+            source_name=str(source),
+            target_name=str(target),
+        )
+
+    return converted
+
+
+def load_bloodhound_zip(uploaded_file):
+    """
+    Load a compatible SharpHound/BloodHound ZIP.
+
+    This is a dashboard-level generic loader.
+    It does not change the core StealthPath
+    graph implementation.
+    """
+
+    graph = nx.MultiDiGraph()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+
+        zip_path = (
+            Path(temp_dir)
+            / "uploaded.zip"
+        )
+
+        zip_path.write_bytes(
+            uploaded_file.getvalue()
+        )
+
+        extract_dir = (
+            Path(temp_dir)
+            / "collection"
+        )
+
+        extract_dir.mkdir()
+
+        with zipfile.ZipFile(
+            zip_path,
+            "r",
+        ) as archive:
+
+            archive.extractall(
+                extract_dir
+            )
+
+        json_files = list(
+            extract_dir.rglob("*.json")
+        )
+
+        objects = []
+
+        for path in json_files:
+
+            try:
+
+                with open(
+                    path,
+                    "r",
+                    encoding="utf-8",
+                ) as file:
+
+                    content = json.load(file)
+
+                records = content.get(
+                    "data",
+                    [],
+                )
+
+                if not isinstance(
+                    records,
+                    list,
+                ):
+                    continue
+
+                filename = (
+                    path.name.lower()
+                )
+
+                if "_users" in filename:
+                    object_type = "users"
+                elif "_groups" in filename:
+                    object_type = "groups"
+                elif "_computers" in filename:
+                    object_type = "computers"
+                elif "_domains" in filename:
+                    object_type = "domains"
+                elif "_ous" in filename:
+                    object_type = "ous"
+                elif "_containers" in filename:
+                    object_type = "containers"
+                elif "_gpos" in filename:
+                    object_type = "gpos"
+                elif "_certtemplates" in filename:
+                    object_type = "certtemplates"
+                else:
+                    object_type = "unknown"
+
+                for obj in records:
+
+                    if not isinstance(
+                        obj,
+                        dict,
+                    ):
+                        continue
+
+                    obj["_dashboard_object_type"] = (
+                        object_type
+                    )
+
+                    objects.append(obj)
+
+            except Exception:
+                continue
+
+        # Build lookup.
+        lookup = {}
+
+        for obj in objects:
+
+            object_id = obj.get(
+                "ObjectIdentifier"
+            )
+
+            if not object_id:
+                continue
+
+            properties = obj.get(
+                "Properties",
+                {},
+            )
+
+            name = properties.get(
+                "name",
+                object_id,
+            )
+
+            lookup[object_id] = (
+                obj,
+                name,
+            )
+
+            graph.add_node(
+                object_id,
+                name=name,
+                object_type=obj.get(
+                    "_dashboard_object_type",
+                    "unknown",
+                ),
+            )
+
+        # ACL relationships.
+        for target in objects:
+
+            target_id = target.get(
+                "ObjectIdentifier"
+            )
+
+            if not target_id:
+                continue
+
+            target_name = lookup.get(
+                target_id,
+                (None, target_id),
+            )[1]
+
+            for ace in target.get(
+                "Aces",
+                [],
+            ):
+
+                relationship = ace.get(
+                    "RightName"
+                )
+
+                source_id = ace.get(
+                    "PrincipalSID"
+                )
+
+                if (
+                    not relationship
+                    or not source_id
+                ):
+                    continue
+
+                if (
+                    relationship
+                    not in WALKABLE_RELATIONSHIPS
+                ):
+                    continue
+
+                if source_id not in lookup:
+                    continue
+
+                source_name = lookup[
+                    source_id
+                ][1]
+
+                graph.add_edge(
+                    source_id,
+                    target_id,
+                    relationship=relationship,
+                    source_name=source_name,
+                    target_name=target_name,
+                )
+
+        # Group membership.
+        for group in objects:
+
+            if group.get(
+                "_dashboard_object_type"
+            ) != "groups":
+                continue
+
+            group_id = group.get(
+                "ObjectIdentifier"
+            )
+
+            if not group_id:
+                continue
+
+            group_name = lookup.get(
+                group_id,
+                (None, group_id),
+            )[1]
+
+            for member in group.get(
+                "Members",
+                [],
+            ):
+
+                member_id = member.get(
+                    "ObjectIdentifier"
+                )
+
+                if (
+                    not member_id
+                    or member_id not in lookup
+                ):
+                    continue
+
+                member_name = lookup[
+                    member_id
+                ][1]
+
+                graph.add_edge(
+                    member_id,
+                    group_id,
+                    relationship="MemberOf",
+                    source_name=member_name,
+                    target_name=group_name,
+                )
+
+    if graph.number_of_nodes() == 0:
+        raise ValueError(
+            "No compatible BloodHound objects were found."
+        )
+
+    return graph
+
+
+# ---------------------------------------------------------
+# Uploaded graph detection
+# ---------------------------------------------------------
+
+def load_uploaded_graph(uploaded_file):
+
+    filename = (
+        uploaded_file.name.lower()
+    )
+
+    if filename.endswith(".csv"):
+        return (
+            load_csv_graph(uploaded_file),
+            "Generic CSV graph",
+            False,
+        )
+
+    if filename.endswith(".graphml"):
+        return (
+            load_graphml(uploaded_file),
+            "Generic GraphML graph",
+            False,
+        )
+
+    if filename.endswith(".json"):
+        return (
+            load_json_graph(uploaded_file),
+            "Generic JSON graph",
+            False,
+        )
+
+    if filename.endswith(".zip"):
+
+        return (
+            load_bloodhound_zip(
+                uploaded_file
+            ),
+            "BloodHound / SharpHound collection",
+            True,
+        )
+
+    raise ValueError(
+        "Supported formats: CSV, JSON, GraphML, ZIP."
+    )
+
+
+# ---------------------------------------------------------
+# Path helpers
+# ---------------------------------------------------------
 
 def get_direct_relationships(
     graph,
     source,
     target,
 ):
-    """
-    Find all direct relationships from source to target.
 
-    Multiple relationships may exist between the same
-    pair of nodes.
-    """
+    relationships = []
 
     edge_data = graph.get_edge_data(
         source,
@@ -197,1084 +718,839 @@ def get_direct_relationships(
     )
 
     if not edge_data:
-        return []
+        return relationships
 
-    relationships = []
-
-    for data in edge_data.values():
-
-        relationship = data.get(
-            "relationship",
-            "Unknown",
-        )
+    for edge_key, data in edge_data.items():
 
         relationships.append(
-            relationship
+            (
+                edge_key,
+                data.get(
+                    "relationship",
+                    "Unknown",
+                ),
+            )
         )
 
-    return sorted(set(relationships))
+    return relationships
 
 
 def find_unreachable_pair(graph):
-    """
-    Find a pair of different nodes for which no directed
-    path exists in the current graph.
 
-    The pair is calculated from the actual ESSOS graph.
-    """
-
-    nodes = list(graph.nodes)
+    nodes = list(graph.nodes())
 
     for source in nodes:
-
-        reachable_nodes = nx.descendants(
-            graph,
-            source,
-        )
 
         for target in nodes:
 
             if source == target:
                 continue
 
-            if target not in reachable_nodes:
+            if not nx.has_path(
+                graph,
+                source,
+                target,
+            ):
 
                 return source, target
 
-    return None, None
+    return None
 
 
 def find_reachable_pair(graph):
-    """
-    Find a directed source-target pair from the actual graph.
 
-    The known ESSOS demonstration path is preferred.
-    """
+    nodes = list(graph.nodes())
 
-    source = get_node_by_name(
-        "VAGRANT@ESSOS.LOCAL"
-    )
+    for source in nodes:
 
-    target = get_node_by_name(
-        "DOMAIN ADMINS@ESSOS.LOCAL"
-    )
+        for target in nodes:
 
-    if (
-        source is not None
-        and target is not None
-        and nx.has_path(
-            graph,
-            source,
-            target,
-        )
-    ):
+            if source == target:
+                continue
 
-        return source, target
+            if nx.has_path(
+                graph,
+                source,
+                target,
+            ):
 
-    # Fallback: find any reachable pair.
-    for source in graph.nodes:
+                return source, target
 
-        reachable_nodes = nx.descendants(
-            graph,
-            source,
-        )
-
-        if reachable_nodes:
-
-            target = next(
-                iter(reachable_nodes)
-            )
-
-            return source, target
-
-    return None, None
+    return None
 
 
 # ---------------------------------------------------------
 # Graph visualization
 # ---------------------------------------------------------
 
-def build_attack_graph_view(
+def create_subgraph_for_display(
     graph,
-    center_node,
+    source=None,
+    target=None,
     depth=2,
-    max_nodes=40,
 ):
-    """
-    Create a readable visualization of the graph around
-    the selected node.
 
-    This only creates a visualization subgraph.
-    The original graph is not modified.
-    """
+    selected = set()
 
-    nodes_by_distance = (
-        nx.single_source_shortest_path_length(
+    if source in graph:
+        selected.add(source)
+
+    if target in graph:
+        selected.add(target)
+
+    if not selected:
+
+        return graph
+
+    nodes = set(selected)
+
+    for node in list(selected):
+
+        reachable = nx.single_source_shortest_path_length(
             graph,
-            center_node,
+            node,
             cutoff=depth,
         )
-    )
 
-    selected_nodes = sorted(
-        nodes_by_distance,
-        key=lambda node: nodes_by_distance[node],
-    )[:max_nodes]
+        nodes.update(
+            reachable.keys()
+        )
 
-    subgraph = graph.subgraph(
-        selected_nodes
-    ).copy()
+    return graph.subgraph(nodes).copy()
 
-    # -----------------------------------------------------
-    # Graphviz DOT
-    # -----------------------------------------------------
 
-    dot = [
+def graph_to_dot(graph):
+
+    lines = [
         "digraph G {",
-        "rankdir=LR;",
-        'graph [pad="0.4", nodesep="0.5", ranksep="0.8"];',
-        'node [shape=box, style="rounded", fontname="Arial"];',
-        'edge [fontname="Arial", fontsize=9];',
+        'rankdir="LR";',
+        'node [shape=box, style="rounded"];',
     ]
 
-    # Graphviz uses simple internal IDs.
-    # These are not displayed to the user.
-    node_ids = {
-        node: f"n{index}"
-        for index, node in enumerate(
-            subgraph.nodes
-        )
-    }
-
-    # -----------------------------------------------------
-    # Nodes
-    # -----------------------------------------------------
-
-    for node in subgraph.nodes:
-
-        graph_id = node_ids[node]
-
-        name = get_node_name(node)
-        node_type = get_node_type(node)
-
-        safe_name = (
-            str(name)
-            .replace('"', '\\"')
-            .replace("\n", " ")
-        )
-
-        safe_type = (
-            str(node_type)
-            .replace('"', '\\"')
-            .replace("\n", " ")
-        )
-
-        label = (
-            f"{safe_name}\\n"
-            f"[{safe_type}]"
-        )
-
-        if node == center_node:
-
-            dot.append(
-                f'{graph_id} '
-                f'[label="{label}\\nSELECTED", '
-                f'penwidth=3];'
-            )
-
-        else:
-
-            dot.append(
-                f'{graph_id} '
-                f'[label="{label}"];'
-            )
-
-    # -----------------------------------------------------
-    # Edges
-    # -----------------------------------------------------
-
-    for source, target in subgraph.edges():
-
-        edge_data = subgraph.get_edge_data(
-            source,
-            target,
-        )
-
-        if not edge_data:
-            continue
-
-        relationships = sorted(
-            {
-                data.get(
-                    "relationship",
-                    "Unknown",
-                )
-                for data in edge_data.values()
-            }
-        )
-
-        relationship_text = ", ".join(
-            relationships
-        )
-
-        safe_relationship = (
-            relationship_text
-            .replace('"', '\\"')
-            .replace("\n", " ")
-        )
-
-        dot.append(
-            f'{node_ids[source]} -> '
-            f'{node_ids[target]} '
-            f'[label="{safe_relationship}"];'
-        )
-
-    dot.append("}")
-
-    return "\n".join(dot), subgraph
-
-
-# ---------------------------------------------------------
-# Path visualization
-# ---------------------------------------------------------
-
-def show_path(graph, path):
-
-    for index, edge_key in enumerate(
-        path.edges
+    for node, data in graph.nodes(
+        data=True
     ):
 
-        current = path.nodes[index]
-        next_node = path.nodes[index + 1]
-
-        edge = graph.get_edge_data(
-            current,
-            next_node,
-            key=edge_key,
+        name = str(
+            data.get(
+                "name",
+                node,
+            )
+        ).replace(
+            '"',
+            "'",
         )
 
-        relationship = edge.get(
-            "relationship",
-            "Unknown",
+        lines.append(
+            f'"{node}" '
+            f'[label="{name}"];'
         )
 
-        st.markdown(
-            f"""
-            <div class="path-step">
-                {get_node_name(current)}
-            </div>
+    for source, target, data in graph.edges(
+        data=True
+    ):
 
-            <div class="path-relation">
-                ↓ {relationship} ↓
-            </div>
-            """,
-            unsafe_allow_html=True,
+        relationship = str(
+            data.get(
+                "relationship",
+                "Unknown",
+            )
+        ).replace(
+            '"',
+            "'",
         )
 
-    st.markdown(
-        f"""
-        <div class="path-step">
-            {get_node_name(path.nodes[-1])}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+        lines.append(
+            f'"{source}" -> "{target}" '
+            f'[label="{relationship}"];'
+        )
+
+    lines.append("}")
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------
-# Find demonstration pairs
+# Session state
 # ---------------------------------------------------------
 
-reachable_source, reachable_target = (
-    find_reachable_pair(graph)
-)
+if "graph" not in st.session_state:
 
-unreachable_source, unreachable_target = (
-    find_unreachable_pair(graph)
-)
+    if ESSOS_DIR.exists():
 
+        st.session_state.graph = (
+            build_attack_graph(
+                ESSOS_DIR
+            )
+        )
 
-reachable_source_name = (
-    get_node_name(reachable_source)
-    if reachable_source is not None
-    else None
-)
+        st.session_state.source_type = (
+            "ESSOS SharpHound Dataset"
+        )
 
-reachable_target_name = (
-    get_node_name(reachable_target)
-    if reachable_target is not None
-    else None
-)
+        st.session_state.analysis_supported = True
 
-unreachable_source_name = (
-    get_node_name(unreachable_source)
-    if unreachable_source is not None
-    else None
-)
+    else:
 
-unreachable_target_name = (
-    get_node_name(unreachable_target)
-    if unreachable_target is not None
-    else None
-)
+        st.session_state.graph = (
+            nx.MultiDiGraph()
+        )
+
+        st.session_state.source_type = (
+            "No graph loaded"
+        )
+
+        st.session_state.analysis_supported = False
 
 
 # ---------------------------------------------------------
 # Header
 # ---------------------------------------------------------
 
+st.title("StealthPath")
+
 st.markdown(
-    """
-    <div class="header-box">
-        <h1>STEALTHPATH</h1>
-        <p>
-            Comparative Attack Path Planning Under
-            Adaptive Defender Visibility
-        </p>
-    </div>
-    """,
-    unsafe_allow_html=True,
+    "Detection-Aware Attack Path Planning in Active Directory"
 )
+
+st.divider()
 
 
 # ---------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------
 
-st.sidebar.title("Dashboard Controls")
+with st.sidebar:
 
-st.sidebar.markdown(
-    "Use the controls below to explore the graph "
-    "and test attack-path connectivity."
-)
+    st.header("Graph Input")
 
-
-# =========================================================
-# SIDEBAR — GRAPH VIEW
-# =========================================================
-
-st.sidebar.subheader("1. Graph View")
-
-st.sidebar.caption(
-    "Controls the attack graph displayed above."
-)
-
-
-node_names = sorted(
-    get_node_name(node)
-    for node in graph.nodes
-)
-
-
-selected_name = st.sidebar.selectbox(
-    "Node to Explore",
-    node_names,
-)
-
-
-selected_node = get_node_by_name(
-    selected_name
-)
-
-
-depth = st.sidebar.slider(
-    "Graph Depth",
-    min_value=1,
-    max_value=3,
-    value=2,
-)
-
-
-st.sidebar.caption(
-    "Graph depth controls how many relationship "
-    "levels around the selected node are displayed."
-)
-
-
-# =========================================================
-# SIDEBAR — PATH TEST
-# =========================================================
-
-st.sidebar.subheader("2. Path Test")
-
-st.sidebar.caption(
-    "Controls the source and target used for "
-    "connectivity testing."
-)
-
-
-test_mode = st.sidebar.radio(
-    "Test Case",
-    [
-        "Verified Reachable Case",
-        "Graph-Verified Unreachable Case",
-        "Custom Source and Target",
-    ],
-)
-
-
-# ---------------------------------------------------------
-# Determine source and target
-# ---------------------------------------------------------
-
-if test_mode == "Verified Reachable Case":
-
-    source_name = reachable_source_name
-    target_name = reachable_target_name
-
-    st.sidebar.info(
-        "This uses the verified ESSOS path "
-        "VAGRANT → DOMAIN ADMINS when available."
+    input_mode = st.radio(
+        "Data source",
+        [
+            "ESSOS Dataset",
+            "Upload Graph",
+        ],
     )
 
-
-elif test_mode == "Graph-Verified Unreachable Case":
-
-    source_name = unreachable_source_name
-    target_name = unreachable_target_name
-
-    st.sidebar.info(
-        "This pair is automatically selected "
-        "from the current ESSOS graph so that "
-        "no directed path exists."
-    )
-
-
-else:
-
-    source_name = st.sidebar.selectbox(
-        "Source",
-        node_names,
-        key="custom_source",
-    )
-
-    target_name = st.sidebar.selectbox(
-        "Target",
-        node_names,
-        key="custom_target",
-    )
-
-
-# ---------------------------------------------------------
-# Validate demo pair availability
-# ---------------------------------------------------------
-
-if source_name is None or target_name is None:
-
-    st.error(
-        "A suitable source-target pair could not "
-        "be found in the current graph."
-    )
-
-    st.stop()
-
-
-source = get_node_by_name(
-    source_name
-)
-
-target = get_node_by_name(
-    target_name
-)
-
-
-# ---------------------------------------------------------
-# Sidebar explanation
-# ---------------------------------------------------------
-
-st.sidebar.divider()
-
-st.sidebar.subheader("What the controls mean")
-
-st.sidebar.write(
-    "**Node to Explore:** "
-    "Selects the center of the graph visualization."
-)
-
-st.sidebar.write(
-    "**Graph Depth:** "
-    "Controls how many relationship levels are shown "
-    "around that node."
-)
-
-st.sidebar.write(
-    "**Source:** "
-    "The node where the attacker starts."
-)
-
-st.sidebar.write(
-    "**Target:** "
-    "The node the attacker is trying to reach."
-)
-
-st.sidebar.write(
-    "**Direct Relationship:** "
-    "Checks whether one edge directly connects "
-    "source to target."
-)
-
-st.sidebar.write(
-    "**Directed Path:** "
-    "Checks whether a sequence of outgoing "
-    "relationships can connect source to target."
-)
-
-
-# =========================================================
-# MAIN — ATTACK GRAPH
-# =========================================================
-
-st.header("1. Attack Graph")
-
-st.markdown(
-    """
-    <div class="guide-box">
-        This is the real ESSOS BloodHound graph loaded by
-        StealthPath. Select a node from the sidebar to
-        explore its surrounding relationships.
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-dot_graph, displayed_graph = (
-    build_attack_graph_view(
-        graph,
-        selected_node,
-        depth=depth,
-    )
-)
-
-
-st.graphviz_chart(
-    dot_graph,
-    use_container_width=True,
-)
-
-
-# ---------------------------------------------------------
-# Graph statistics
-# ---------------------------------------------------------
-
-col1, col2, col3, col4 = st.columns(4)
-
-with col1:
-
-    st.markdown(
-        f"""
-        <div class="metric-box">
-            <div class="metric-number">
-                {graph.number_of_nodes()}
-            </div>
-            <div class="metric-label">
-                Total Nodes
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-with col2:
-
-    st.markdown(
-        f"""
-        <div class="metric-box">
-            <div class="metric-number">
-                {graph.number_of_edges()}
-            </div>
-            <div class="metric-label">
-                Walkable Edges
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-with col3:
-
-    st.markdown(
-        f"""
-        <div class="metric-box">
-            <div class="metric-number">
-                {displayed_graph.number_of_nodes()}
-            </div>
-            <div class="metric-label">
-                Displayed Nodes
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-with col4:
-
-    st.markdown(
-        f"""
-        <div class="metric-box">
-            <div class="metric-number">
-                {displayed_graph.number_of_edges()}
-            </div>
-            <div class="metric-label">
-                Displayed Edges
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-# =========================================================
-# MAIN — SELECTED NODE
-# =========================================================
-
-st.header("2. Selected Node")
-
-node_col1, node_col2 = st.columns(2)
-
-with node_col1:
-
-    st.markdown(
-        f"""
-        <div class="info-box">
-            <strong>Node Name</strong><br><br>
-            {get_node_name(selected_node)}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-with node_col2:
-
-    st.markdown(
-        f"""
-        <div class="info-box">
-            <strong>Node Type</strong><br><br>
-            {get_node_type(selected_node)}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-# =========================================================
-# MAIN — AVAILABLE TRANSITIONS
-# =========================================================
-
-st.header("3. Available Attack Transitions")
-
-st.write(
-    "These are the outgoing walkable relationships "
-    "available from the selected node."
-)
-
-
-transitions = get_available_transitions(
-    graph,
-    selected_node,
-)
-
-
-if not transitions:
-
-    st.info(
-        "No outgoing walkable transitions were found "
-        "from this node in the current graph."
-    )
-
-else:
-
-    transition_rows = []
-
-    for transition in transitions:
-
-        transition_rows.append(
-            {
-                "Target": transition[
-                    "target_name"
-                ],
-                "Relationship": transition[
-                    "relationship"
-                ],
-                # "Edge Key": transition[
-                #     "edge_key"
-                # ],
-            }
+    if input_mode == "Upload Graph":
+
+        uploaded_file = st.file_uploader(
+            "Upload graph",
+            type=[
+                "csv",
+                "json",
+                "graphml",
+                "zip",
+            ],
+            help=(
+                "CSV, JSON and GraphML are "
+                "supported for generic graph "
+                "visualization. ZIP supports "
+                "compatible BloodHound/"
+                "SharpHound collections."
+            ),
         )
 
-    st.dataframe(
-        transition_rows,
-        use_container_width=True,
-        hide_index=True,
-    )
-
-
-# =========================================================
-# MAIN — PATH EXPLORER
-# =========================================================
-
-st.header("4. Attack Path Explorer")
-
-st.markdown(
-    """
-    <div class="guide-box">
-        <strong>Source</strong> = where the attacker starts.<br>
-        <strong>Target</strong> = the node the attacker wants to reach.<br>
-        <strong>Direct relationship</strong> = one edge directly connects them.<br>
-        <strong>Directed path</strong> = one or more outgoing relationships connect them.
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-# ---------------------------------------------------------
-# Display selected source and target
-# ---------------------------------------------------------
-
-path_col1, path_col2 = st.columns(2)
-
-with path_col1:
-
-    st.markdown(
-        f"""
-        <div class="info-box">
-            <strong>Source</strong><br><br>
-            {source_name}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-with path_col2:
-
-    st.markdown(
-        f"""
-        <div class="info-box">
-            <strong>Target</strong><br><br>
-            {target_name}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-# =========================================================
-# CONNECTIVITY CHECK
-# =========================================================
-
-st.subheader("Connectivity Check")
-
-
-if source == target:
-
-    st.info(
-        "Source and target are the same node. "
-        "Choose two different nodes for a path test."
-    )
-
-else:
-
-    direct_relationships = (
-        get_direct_relationships(
-            graph,
-            source,
-            target,
-        )
-    )
-
-    has_direct_relationship = (
-        len(direct_relationships) > 0
-    )
-
-    has_directed_path = nx.has_path(
-        graph,
-        source,
-        target,
-    )
-
-
-    check_col1, check_col2 = st.columns(2)
-
-
-    # -----------------------------------------------------
-    # Direct relationship
-    # -----------------------------------------------------
-
-    with check_col1:
-
-        if has_direct_relationship:
-
-            relationship_text = ", ".join(
-                direct_relationships
-            )
-
-            st.markdown(
-                f"""
-                <div class="status-box">
-                    <strong>Direct Relationship</strong>
-                    <br><br>
-                    Yes
-                    <br><br>
-                    Relationship(s):
-                    {relationship_text}
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-        else:
-
-            st.markdown(
-                """
-                <div class="status-box">
-                    <strong>Direct Relationship</strong>
-                    <br><br>
-                    No
-                    <br><br>
-                    No single outgoing edge connects
-                    the selected source directly to
-                    the selected target.
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-
-    # -----------------------------------------------------
-    # Directed path
-    # -----------------------------------------------------
-
-    with check_col2:
-
-        if has_directed_path:
+        if uploaded_file:
 
             try:
 
-                hop_count = nx.shortest_path_length(
-                    graph,
-                    source,
-                    target,
+                (
+                    uploaded_graph,
+                    uploaded_type,
+                    attack_graph_ready,
+                ) = load_uploaded_graph(
+                    uploaded_file
                 )
 
-            except Exception:
+                st.session_state.graph = (
+                    uploaded_graph
+                )
 
-                hop_count = "Available"
+                st.session_state.source_type = (
+                    uploaded_type
+                )
 
+                st.session_state.analysis_supported = (
+                    attack_graph_ready
+                )
 
-            st.markdown(
-                f"""
-                <div class="status-box">
-                    <strong>Directed Path</strong>
-                    <br><br>
-                    Yes
-                    <br><br>
-                    A directed path exists from
-                    source to target.
-                    <br><br>
-                    Minimum graph distance:
-                    {hop_count} transition(s)
-                </div>
-                """,
-                unsafe_allow_html=True,
+                st.success(
+                    "Graph loaded successfully."
+                )
+
+            except Exception as error:
+
+                st.error(
+                    f"Could not load graph: {error}"
+                )
+
+    else:
+
+        if ESSOS_DIR.exists():
+
+            st.session_state.graph = (
+                build_attack_graph(
+                    ESSOS_DIR
+                )
+            )
+
+            st.session_state.source_type = (
+                "ESSOS SharpHound Dataset"
+            )
+
+            st.session_state.analysis_supported = (
+                True
             )
 
         else:
 
-            st.markdown(
-                """
-                <div class="status-box">
-                    <strong>Directed Path</strong>
-                    <br><br>
-                    No
-                    <br><br>
-                    No directed attack path exists
-                    from source to target in the
-                    current graph.
-                </div>
-                """,
-                unsafe_allow_html=True,
+            st.warning(
+                "ESSOS dataset was not found."
             )
 
+    st.divider()
 
-# =========================================================
-# CALCULATE SHORTEST PATH
-# =========================================================
+    st.header("Graph View")
 
-if st.button(
-    "Calculate Shortest Path",
-    use_container_width=True,
-):
+    graph = st.session_state.graph
 
-    if source == target:
+    node_names = [
+        get_node_name(
+            graph,
+            node,
+        )
+        for node in graph.nodes()
+    ]
 
-        st.warning(
-            "Source and target must be different."
+    if node_names:
+
+        selected_name = st.selectbox(
+            "Selected node",
+            sorted(node_names),
         )
 
-    elif not nx.has_path(
-        graph,
-        source,
-        target,
-    ):
-
-        st.error(
-            "No directed path exists between "
-            "the selected source and target."
+        selected_node = get_node_by_name(
+            graph,
+            selected_name,
         )
 
-        st.caption(
-            "The current directed attack graph contains "
-            "no sequence of walkable relationships from "
-            "the selected source to the selected target."
+        depth = st.slider(
+            "Graph depth",
+            min_value=1,
+            max_value=3,
+            value=1,
         )
 
     else:
 
+        selected_node = None
+        depth = 1
+
+
+# ---------------------------------------------------------
+# Main graph reference
+# ---------------------------------------------------------
+
+graph = st.session_state.graph
+
+
+# ---------------------------------------------------------
+# Overview
+# ---------------------------------------------------------
+
+st.header("Graph Overview")
+
+col1, col2, col3, col4 = st.columns(4)
+
+with col1:
+    st.metric(
+        "Nodes",
+        graph.number_of_nodes(),
+    )
+
+with col2:
+    st.metric(
+        "Edges",
+        graph.number_of_edges(),
+    )
+
+with col3:
+    st.metric(
+        "Node Types",
+        len(
+            get_node_type_counts(
+                graph
+            )
+        ),
+    )
+
+with col4:
+    st.metric(
+        "Relationships",
+        len(
+            get_relationship_counts(
+                graph
+            )
+        ),
+    )
+
+st.caption(
+    f"Data source: {st.session_state.source_type}"
+)
+
+
+# ---------------------------------------------------------
+# Graph structure
+# ---------------------------------------------------------
+
+st.header("Graph Structure")
+
+structure_col1, structure_col2 = st.columns(2)
+
+with structure_col1:
+
+    st.subheader("Node Types")
+
+    node_type_counts = (
+        get_node_type_counts(graph)
+    )
+
+    if node_type_counts:
+
+        st.dataframe(
+            [
+                {
+                    "Node Type": node_type,
+                    "Count": count,
+                }
+                for node_type, count in sorted(
+                    node_type_counts.items()
+                )
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    else:
+
+        st.info("No nodes available.")
+
+
+with structure_col2:
+
+    st.subheader("Relationships")
+
+    relationship_counts = (
+        get_relationship_counts(graph)
+    )
+
+    if relationship_counts:
+
+        st.dataframe(
+            [
+                {
+                    "Relationship": relationship,
+                    "Count": count,
+                }
+                for relationship, count in sorted(
+                    relationship_counts.items(),
+                    key=lambda item: item[1],
+                    reverse=True,
+                )
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    else:
+
+        st.info("No relationships available.")
+
+
+# ---------------------------------------------------------
+# Graph visualization
+# ---------------------------------------------------------
+
+st.header("Graph Visualization")
+
+display_graph = create_subgraph_for_display(
+    graph,
+    source=selected_node,
+    depth=depth,
+)
+
+if display_graph.number_of_nodes() > 0:
+
+    st.graphviz_chart(
+        graph_to_dot(
+            display_graph
+        )
+    )
+
+    st.caption(
+        "Visualization shows the selected node "
+        "and nearby directed relationships."
+    )
+
+else:
+
+    st.info(
+        "Select a node to explore the graph."
+    )
+
+
+# ---------------------------------------------------------
+# Source and target
+# ---------------------------------------------------------
+
+st.header("Source & Target")
+
+if graph.number_of_nodes() >= 2:
+
+    names = sorted(
+        [
+            get_node_name(
+                graph,
+                node,
+            )
+            for node in graph.nodes()
+        ]
+    )
+
+    source_name = st.selectbox(
+        "Source node",
+        names,
+        key="source_selector",
+    )
+
+    target_name = st.selectbox(
+        "Target node",
+        names,
+        index=min(
+            1,
+            len(names) - 1,
+        ),
+        key="target_selector",
+    )
+
+    source = get_node_by_name(
+        graph,
+        source_name,
+    )
+
+    target = get_node_by_name(
+        graph,
+        target_name,
+    )
+
+else:
+
+    source = None
+    target = None
+
+    st.info(
+        "At least two nodes are required."
+    )
+
+
+# ---------------------------------------------------------
+# Planner comparison
+# ---------------------------------------------------------
+
+st.header("Planner Comparison")
+
+planner_col1, planner_col2, planner_col3 = st.columns(3)
+
+with planner_col1:
+
+    st.subheader("Shortest Path")
+
+    st.write(
+        "Minimizes the number of graph transitions."
+    )
+
+    if (
+        source
+        and target
+        and source != target
+    ):
+
         try:
 
-            path = find_shortest_path(
+            shortest = find_shortest_path(
                 graph,
                 source,
                 target,
             )
 
-
             st.success(
-                f"Shortest path found: "
-                f"{path.length} transitions"
+                f"Path found: {shortest.length} hops"
             )
 
-
-            result_col1, result_col2, result_col3 = (
-                st.columns(3)
+            st.write(
+                f"Cost: {shortest.cost}"
             )
-
-
-            with result_col1:
-
-                st.metric(
-                    "Planner",
-                    path.planner,
-                )
-
-
-            with result_col2:
-
-                st.metric(
-                    "Transitions",
-                    path.length,
-                )
-
-
-            with result_col3:
-
-                st.metric(
-                    "Cost",
-                    path.cost,
-                )
-
-
-            st.subheader("Path")
-
-            show_path(
-                graph,
-                path,
-            )
-
 
         except nx.NetworkXNoPath:
 
-            st.error(
-                "No directed path exists between "
-                "the selected source and target."
+            st.warning(
+                "No path exists between the selected nodes."
             )
-
 
         except Exception as error:
 
             st.error(
-                f"Path calculation failed: {error}"
+                f"Shortest-path analysis is "
+                f"not available for this graph: "
+                f"{error}"
             )
 
+with planner_col2:
 
-# =========================================================
-# MAIN — IMPLEMENTED COMPONENTS
-# =========================================================
-
-st.header("5. Implemented Components")
-
-implemented = [
-    "ESSOS SharpHound graph construction",
-    "Walkable attack-transition extraction",
-    "Multi-edge / edge-key representation",
-    "Path representation and validation",
-    "Shortest-path baseline",
-    "Directed connectivity checking",
-    "Human-readable attack-graph visualization",
-    "Verified reachable and unreachable test cases",
-    "Automated test suite: 16 tests passing",
-]
-
-
-for item in implemented:
+    st.subheader("Risk-Weighted")
 
     st.write(
-        f"— {item}"
+        "Uses detection-aware transition costs."
+    )
+
+    st.info(
+        "Not implemented yet."
+    )
+
+with planner_col3:
+
+    st.subheader("Reinforcement Learning")
+
+    st.write(
+        "Learns a path-selection policy from experience."
+    )
+
+    st.info(
+        "Not implemented yet."
     )
 
 
-# =========================================================
-# MAIN — PROJECT STATUS
-# =========================================================
+# ---------------------------------------------------------
+# Attack path details
+# ---------------------------------------------------------
 
-st.header("6. Current Project Status")
+st.header("Attack-Path Result")
+
+if (
+    source
+    and target
+    and source != target
+):
+
+    try:
+
+        shortest = find_shortest_path(
+            graph,
+            source,
+            target,
+        )
+
+        st.subheader(
+            "Shortest-Path Baseline"
+        )
+
+        for index in range(
+            shortest.length
+        ):
+
+            current = (
+                shortest.nodes[index]
+            )
+
+            next_node = (
+                shortest.nodes[index + 1]
+            )
+
+            edge_key = (
+                shortest.edges[index]
+            )
+
+            edge_data = graph.get_edge_data(
+                current,
+                next_node,
+                key=edge_key,
+            )
+
+            relationship = (
+                edge_data.get(
+                    "relationship",
+                    "Unknown",
+                )
+                if edge_data
+                else "Unknown"
+            )
+
+            st.write(
+                f"**{get_node_name(graph, current)}** "
+                f"→ `{relationship}` → "
+                f"**{get_node_name(graph, next_node)}**"
+            )
+
+    except nx.NetworkXNoPath:
+
+        st.info(
+            "No directed path exists between "
+            "the selected source and target."
+        )
+
+    except Exception as error:
+
+        st.warning(
+            f"Path result unavailable: {error}"
+        )
+
+else:
+
+    st.info(
+        "Select different source and target nodes "
+        "to test a path."
+    )
+
+
+# ---------------------------------------------------------
+# Transition inspection
+# ---------------------------------------------------------
+
+st.header("Available Transitions")
+
+if selected_node:
+
+    transitions = get_available_transitions(
+        graph,
+        selected_node,
+    )
+
+    if transitions:
+
+        transition_rows = []
+
+        for transition in transitions:
+
+            transition_rows.append(
+                {
+                    "Target": get_node_name(
+                        graph,
+                        transition["target"],
+                    ),
+                    "Relationship": transition[
+                        "relationship"
+                    ],
+                }
+            )
+
+        st.dataframe(
+            transition_rows,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    else:
+
+        st.info(
+            "The selected node has no outgoing "
+            "walkable transitions in the current graph."
+        )
+
+
+# ---------------------------------------------------------
+# Analysis readiness
+# ---------------------------------------------------------
+
+st.header("Analysis Readiness")
+
+status_col1, status_col2 = st.columns(2)
+
+with status_col1:
+
+    st.subheader("Graph")
+
+    st.write(
+        "Graph loaded: Yes"
+        if graph.number_of_nodes() > 0
+        else "Graph loaded: No"
+    )
+
+    st.write(
+        f"Nodes detected: {graph.number_of_nodes()}"
+    )
+
+    st.write(
+        f"Edges detected: {graph.number_of_edges()}"
+    )
+
+    if st.session_state.analysis_supported:
+
+        st.write(
+            "Attack-graph compatible: Yes"
+        )
+
+    else:
+
+        st.write(
+            "Attack-graph compatible: "
+            "Not established"
+        )
+
+
+with status_col2:
+
+    st.subheader("StealthPath Components")
+
+    st.write(
+        "Graph construction: Implemented"
+    )
+
+    st.write(
+        "Attack transitions: Implemented"
+    )
+
+    st.write(
+        "Shortest-path baseline: Implemented"
+    )
+
+    st.write(
+        "Risk/detection model: Pending"
+    )
+
+    st.write(
+        "Adaptive/RL planner: Pending"
+    )
+
+
+# ---------------------------------------------------------
+# Research status
+# ---------------------------------------------------------
+
+st.header("Research Status")
 
 st.markdown(
     """
-    <div class="info-box">
+    **Current verified components**
 
-    <strong>Currently implemented and verified:</strong>
+    - Real ESSOS SharpHound graph loading
+    - Attack-transition extraction
+    - Shortest-path baseline
+    - Graph structure inspection
+    - Source-to-target path testing
+    - Graph visualization
+    - Generic graph upload and structure visualization
 
-    <br><br>
+    **Still under development**
 
-    Real ESSOS BloodHound graph loading,
-    walkable attack-transition extraction,
-    edge-aware path representation,
-    shortest-path baseline,
-    directed connectivity checking,
-    and dashboard visualization.
-
-    <br><br>
-
-    <strong>Not yet represented as completed:</strong>
-
-    <br><br>
-
-    Risk-aware planning, detection/visibility costs,
-    and reinforcement-learning attack-path planning.
-
-    These components are deliberately not presented
-    as completed results.
-
-    </div>
-    """,
-    unsafe_allow_html=True,
+    - Evidence-backed detection/visibility cost model
+    - Risk-weighted planner
+    - Reinforcement-learning planner
+    - Comparative evaluation
+    """
 )
 
-
-# =========================================================
-# FOOTER
-# =========================================================
-
-st.divider()
-
 st.caption(
-    "StealthPath Review 1 Prototype | "
-    "ESSOS BloodHound graph and verified shortest-path components"
+    "Generic uploaded graphs are not automatically treated "
+    "as validated Active Directory attack graphs."
 )
